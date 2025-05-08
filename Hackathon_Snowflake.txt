@@ -1,0 +1,127 @@
+from snowflake.snowpark import Session, functions as F
+from getpass import getpass
+ 
+user = getpass("Enter User")
+passwd = getpass("Enter Password")
+ 
+connection_parameters = {
+    "account"  : "onemainfinancial-dev",
+    "user"     : '$user',
+    "password" : '$passwd',
+    "role"     : "ACCOUNTADMIN",
+    "warehouse": "ANALYSIS_01",
+    "database" : "SNOWFLAKE",
+    "schema"   : "ACCOUNT_USAGE",
+    "authenticator" : 'externalbrowser',
+"client_session_keep_alive" : True
+}
+session = Session.builder.configs(connection_parameters).create()
+ 
+
+days_back = 10
+warehouse = "ANALYSIS_01"
+ 
+load_df = (
+    session.table("WAREHOUSE_LOAD_HISTORY")
+           .filter(F.col("WAREHOUSE_NAME") == warehouse)
+           .filter(
+               F.col("START_TIME")
+>= F.dateadd("day", F.lit(-days_back), F.current_timestamp())
+           )
+           .with_column("DAY", F.col("START_TIME").cast("date"))
+           .group_by("DAY")
+           .agg(
+               F.avg("AVG_RUNNING")    .alias("avg_running"),
+               F.max("AVG_RUNNING")    .alias("peak_running"),
+               F.avg("AVG_QUEUED_LOAD").cast("double").alias("avg_queued_load"),
+               F.avg("AVG_BLOCKED")    .alias("avg_blocked"),
+           )
+)
+ 
+meter_df = (
+    session.table("WAREHOUSE_METERING_HISTORY")
+           .filter(F.col("WAREHOUSE_NAME") == warehouse)
+           .filter(
+               F.col("START_TIME")
+>= F.dateadd("day", F.lit(-days_back), F.current_timestamp())
+           )
+           .with_column("DAY", F.col("START_TIME").cast("date"))
+           .group_by("DAY")
+           .agg(F.sum("CREDITS_USED").alias("credits"))
+)
+ 
+history_df = load_df.join(meter_df, "DAY").sort("DAY")
+ 
+ 
+payload = [row.as_dict() for row in history_df.collect()]
+ 
+ 
+system_message = (
+    "You are a FinOps engineer who analyses the Snowflake warehouse usage metrics and generates optimization recommendations"
+    "ONLY returns a single JSON object. "
+    "Never add narrative text. "
+)
+ 
+payload_block = json.dumps(payload, indent=2, default=str)
+ 
+user_message = (
+    f"Here is the aggregated warehouse data:\n"
+    f"```json\n{payload_block}\n```\n\n"
+ 
+    "### Tasks\n"
+    "1. Compute week-over-week and month-over-month growth (%): avg_running, peak_running, credits.\n"
+    "2. List any day where avg_queued_load > 0.50.\n"
+    "3. Recommend:\n"
+    "   • warehouse_size   (XSMALL, SMALL, …, 4XL)\n"
+    "   • min_cluster_count / max_cluster_count (ints)\n"
+    "   • auto_suspend_sec (int)\n"
+    "   • auto_resume (bool)\n\n"
+ 
+    "### Response schema (output EXACTLY this, no extra keys)\n"
+    "```json\n"
+    "{\n"
+    "  \"insights\": {\n"
+    "    \"growth\": {\n"
+    "      \"weekly\":  {\"avg_running\": 0.0, \"peak_running\": 0.0, \"credits\": 0.0},\n"
+    "      \"monthly\": {\"avg_running\": 0.0, \"peak_running\": 0.0, \"credits\": 0.0}\n"
+    "    },\n"
+    "    \"bottlenecks\": [\n"
+    "      {\"day\": \"YYYY-MM-DD\", \"avg_queued_load\": 0.0}\n"
+    "    ]\n"
+    "  },\n"
+    "  \"recommendations\": {\n"
+    "    \"warehouse_size\": \"SMALL\",\n"
+    "    \"min_cluster\": 1,\n"
+    "    \"max_cluster\": 3,\n"
+    "    \"auto_suspend_sec\": 60,\n"
+    "    \"auto_resume\": true\n"
+    "  },\n"
+    "  \"confidence\": 0.0\n"
+    "}\n"
+    "```\n"
+    "Return the JSON object only."
+)
+print("=== Payload Generated for Analysis ===")
+print(json.dumps(payload, indent=2, default=str))
+ 
+from openai import OpenAI                 
+ 
+client = OpenAI(
+    base_url="http://localhost:11434/v1", 
+    api_key="ollama"                      
+)
+ 
+response = client.chat.completions.create(
+    model="llama3:8b",
+    messages=[
+        {"role": "system", "content": system_message},
+        {"role": "user",   "content": user_message},
+    ],
+    response_format={"type": "json_object"},
+    temperature=0.0
+)
+ 
+result = json.loads(response.choices[0].message.content)
+ 
+print("=== LLM result ===")
+print(json.dumps(result, indent=2))
